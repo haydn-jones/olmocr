@@ -40,6 +40,10 @@ dependencies = [
   "transformers==4.53.2",
   "img2pdf",
   "beaker-py",
+  "aiofiles>=24.1.0",
+  "openai>=1.90.0",
+  "coloredlogs>=15.0.1",
+  "sshfs>=2023.1.0",
 ]
 license = {file = "LICENSE"}
 

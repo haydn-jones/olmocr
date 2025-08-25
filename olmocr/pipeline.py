@@ -47,6 +47,11 @@ from olmocr.s3_utils import (
     get_s3_bytes_with_backoff,
     parse_s3_path,
 )
+from olmocr.ssh_utils import (
+    cleanup_ssh_connections,
+    expand_ssh_glob,
+    get_ssh_bytes_with_backoff,
+)
 from olmocr.train.dataloader import FrontMatterParser
 from olmocr.version import VERSION
 from olmocr.work_queue import LocalBackend, S3Backend, WorkQueue
@@ -338,25 +343,45 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
 
 
 async def process_pdf(args, worker_id: int, pdf_orig_path: str):
-    with tempfile.NamedTemporaryFile("wb+", suffix=".pdf", delete=False) as tf:
-        try:
+    # Create temporary file and ensure cleanup
+    tf = tempfile.NamedTemporaryFile("wb+", suffix=".pdf", delete=False)
+    
+    try:
+        # Handle different path types
+        if pdf_orig_path.startswith("ssh://") or pdf_orig_path.startswith("sftp://"):
+            data = await asyncio.to_thread(lambda: get_ssh_bytes_with_backoff(pdf_orig_path))
+        else:
             data = await asyncio.to_thread(lambda: get_s3_bytes_with_backoff(pdf_s3, pdf_orig_path))
-            tf.write(data)
-            tf.flush()
-        except ClientError as ex:
-            if ex.response["Error"]["Code"] == "NoSuchKey":
-                logger.info(f"S3 File Not found, skipping it completely {pdf_orig_path}")
-                return None
-            else:
-                raise
-
-        if is_png(tf.name) or is_jpeg(tf.name):
-            logger.info(f"Converting {pdf_orig_path} from image to PDF format...")
-            tf.seek(0)
-            tf.write(convert_image_to_pdf_bytes(tf.name))
-            tf.flush()
+        tf.write(data)
+        tf.flush()
+    except ClientError as ex:
+        tf.close()
+        if ex.response["Error"]["Code"] == "NoSuchKey":
+            logger.info(f"S3 File Not found, skipping it completely {pdf_orig_path}")
+            # Clean up temp file before returning
+            if os.path.exists(tf.name):
+                os.unlink(tf.name)
+            return None
+        else:
+            raise
+    except FileNotFoundError:
+        tf.close()
+        logger.info(f"SSH File not found, skipping it completely {pdf_orig_path}")
+        # Clean up temp file before returning
+        if os.path.exists(tf.name):
+            os.unlink(tf.name)
+        return None
+    finally:
+        if tf and not tf.closed:
+            tf.close()
 
     try:
+        # Handle image conversion
+        if is_png(tf.name) or is_jpeg(tf.name):
+            logger.info(f"Converting {pdf_orig_path} from image to PDF format...")
+            with open(tf.name, "wb") as f:
+                f.write(convert_image_to_pdf_bytes(tf.name))
+
         try:
             reader = PdfReader(tf.name)
             num_pages = reader.get_num_pages()
@@ -1041,7 +1066,7 @@ async def main():
     parser.add_argument(
         "--pdfs",
         nargs="*",
-        help="Path to add pdfs stored in s3 to the workspace, can be a glob path s3://bucket/prefix/*.pdf or path to file containing list of pdf paths",
+        help="Path to add pdfs to the workspace. Supports S3 (s3://bucket/prefix/*.pdf), SSH (ssh://user@host/path/*.pdf), or local paths. Can also be a path to file containing list of pdf paths",
         default=None,
     )
     parser.add_argument(
@@ -1149,6 +1174,10 @@ async def main():
             if pdf_path.startswith("s3://"):
                 logger.info(f"Expanding s3 glob at {pdf_path}")
                 pdf_work_paths |= set(expand_s3_glob(pdf_s3, pdf_path))
+            # Expand SSH paths
+            elif pdf_path.startswith("ssh://") or pdf_path.startswith("sftp://"):
+                logger.info(f"Expanding ssh glob at {pdf_path}")
+                pdf_work_paths |= set(expand_ssh_glob(pdf_path))
             elif os.path.exists(pdf_path):
                 if (
                     pdf_path.lower().endswith(".pdf")
@@ -1184,7 +1213,11 @@ async def main():
             try:
                 # Download the PDF to a temp file
                 with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp_file:
-                    tmp_file.write(get_s3_bytes(pdf_s3, pdf))
+                    # Handle different path types
+                    if pdf.startswith("ssh://") or pdf.startswith("sftp://"):
+                        tmp_file.write(get_ssh_bytes_with_backoff(pdf))
+                    else:
+                        tmp_file.write(get_s3_bytes(pdf_s3, pdf))
                     tmp_file.flush()
                     if is_png(tmp_file.name) or is_jpeg(tmp_file.name):
                         page_counts.append(1)
@@ -1318,6 +1351,9 @@ async def main():
 
     logger.info("=" * 80)
     logger.info("Work done")
+
+    # Clean up SSH connections
+    cleanup_ssh_connections()
 
 
 if __name__ == "__main__":
