@@ -1,11 +1,13 @@
 import argparse
 import asyncio
+import glob
 import hashlib
 import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import List
+from pathlib import Path
+from typing import AsyncGenerator, List
 
 import aiofiles
 import aiofiles.os
@@ -29,6 +31,54 @@ logger = logging.getLogger(__name__)
 # Suppress noisy logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai._base_client").setLevel(logging.WARNING)
+
+
+async def discover_pdfs(pdf_specs: List[str]) -> AsyncGenerator[str, None]:
+    for spec in pdf_specs:
+        spec = spec.strip()
+        if not spec:
+            continue
+
+        if spec.endswith(".pdf") and await aiofiles.os.path.isfile(spec):
+            yield os.path.abspath(spec)
+            continue
+
+        if await aiofiles.os.path.isdir(spec):
+            async for pdf_path in _crawl_directory_async(spec):
+                yield pdf_path
+            continue
+
+        async for pdf_path in _expand_glob_async(spec):
+            yield pdf_path
+
+
+async def _crawl_directory_async(directory: str) -> AsyncGenerator[str, None]:
+    """Recursively crawl directory for PDF files."""
+    path = Path(directory)
+
+    pattern = str(path / "**" / "*.pdf")
+
+    for pdf_path in glob.glob(pattern, recursive=True):
+        if await aiofiles.os.path.isfile(pdf_path):
+            yield os.path.abspath(pdf_path)
+            await asyncio.sleep(0.001)
+
+
+async def _expand_glob_async(pattern: str) -> AsyncGenerator[str, None]:
+    """Expand glob pattern and yield PDF files."""
+    try:
+        if "**" in pattern:
+            paths = glob.glob(pattern, recursive=True)
+        else:
+            paths = glob.glob(pattern)
+
+        for path in paths:
+            if path.endswith(".pdf") and await aiofiles.os.path.isfile(path):
+                yield os.path.abspath(path)
+                await asyncio.sleep(0.001)
+
+    except Exception as e:
+        logger.warning(f"Failed to expand glob pattern '{pattern}': {e}")
 
 
 @dataclass
@@ -261,10 +311,12 @@ class PdfReaderWorker:
         self.completed_pages = completed_pages
         self.markdown_dir = os.path.join(config.workspace_path, "markdown")
 
-    async def process_pdfs(self, pdf_paths: List[str]) -> None:
-        """Process PDF paths and add page tasks to queue."""
-        for pdf_path in pdf_paths:
-            if not os.path.exists(pdf_path):
+    async def process_pdf_specs(self, pdf_specs: List[str]) -> None:
+        """Process PDF specifications and add page tasks to queue as PDFs are discovered."""
+        pdf_count = 0
+
+        async for pdf_path in discover_pdfs(pdf_specs):
+            if not await aiofiles.os.path.exists(pdf_path):
                 logger.warning(f"PDF not found: {pdf_path}")
                 continue
 
@@ -275,8 +327,15 @@ class PdfReaderWorker:
 
             try:
                 await self._add_pdf_to_queue(pdf_path)
+                pdf_count += 1
+
+                if pdf_count % 100 == 0:
+                    logger.info(f"Discovered and queued {pdf_count} PDFs...")
+
             except Exception as e:
                 logger.error(f"Failed to process {pdf_path}: {e}")
+
+        logger.info(f"PDF discovery complete - found {pdf_count} PDFs to process")
 
     async def _has_existing_output(self, pdf_path: str) -> bool:
         """Check if markdown file already exists for this PDF."""
@@ -322,11 +381,11 @@ class WorkflowCoordinator:
         self.processed_pages = 0
         self.failed_pages = 0
 
-    async def run(self, pdf_paths: List[str]) -> None:
+    async def run(self, pdf_specs: List[str]) -> None:
         """Run the complete workflow."""
         # Start PDF reader worker
         pdf_reader = PdfReaderWorker(self.config, self.page_queue, self.pdf_info, self.completed_pages)
-        pdf_reader_task = asyncio.create_task(pdf_reader.process_pdfs(pdf_paths))
+        pdf_reader_task = asyncio.create_task(pdf_reader.process_pdf_specs(pdf_specs))
 
         # Start metrics reporter
         metrics_task = asyncio.create_task(self._report_metrics())
@@ -452,7 +511,7 @@ def get_openai_client_async(base_url: str | None = None, api_key: str | None = N
 async def main():
     parser = argparse.ArgumentParser(description="OlmOCR Pipeline V2 - Clean Flow-Based Architecture")
     parser.add_argument("workspace", help="Workspace directory")
-    parser.add_argument("--pdfs", nargs="*", help="PDF files to process")
+    parser.add_argument("--pdfs", nargs="*", help="PDF files, directories, or glob patterns to process")
     parser.add_argument("--server", required=True, help="vLLM server URL")
 
     # Configuration
